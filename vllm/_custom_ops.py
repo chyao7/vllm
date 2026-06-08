@@ -367,6 +367,117 @@ def fused_qk_norm_rope(
     )
 
 
+def custom_qk_rmsnorm_rope(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+) -> None:
+    """Q/K RMSNorm + RoPE (NeoX); grid is (tokens, qk_heads), block is 32."""
+    torch.ops._C.custom_qk_rmsnorm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+        eps,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        is_neox,
+        position_ids,
+    )
+
+
+def custom_qkv_proj_rmsnorm_rope(
+    qkv: torch.Tensor,
+    hidden_states: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    qkv_bias: torch.Tensor | None,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+) -> None:
+    """qkv_proj (cuBLAS GEMM) + Q/K RMSNorm + RoPE; results stay in qkv."""
+    torch.ops._C.custom_qkv_proj_rmsnorm_rope(
+        qkv,
+        hidden_states,
+        qkv_weight,
+        qkv_bias,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+        eps,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        is_neox,
+        position_ids,
+    )
+
+
+def custom_qkj_proj_rmsnormal_reshap_cache(
+    qkv: torch.Tensor,
+    hidden_states: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    qkv_bias: torch.Tensor | None,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """GEMM + Q/K RMSNorm + RoPE + fused paged KV write (Flash NHD layout)."""
+    torch.ops._C.custom_qkj_proj_rmsnormal_reshap_cache(
+        qkv,
+        hidden_states,
+        qkv_weight,
+        qkv_bias,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+        eps,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        is_neox,
+        position_ids,
+        key_cache,
+        value_cache,
+        slot_mapping,
+    )
+
+
 def apply_repetition_penalties_torch(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,

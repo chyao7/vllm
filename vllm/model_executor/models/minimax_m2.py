@@ -44,9 +44,15 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.linear_attn import MiniMaxText01RMSNormTP
+from vllm.model_executor.layers.minimax_m2_fused_qkv import (
+    minimax_m2_fused_qkv_available,
+    minimax_m2_fused_qkv_enabled,
+    minimax_m2_fused_qkv_from_hidden,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -225,17 +231,71 @@ class MiniMaxM2Attention(nn.Module):
             self.head_dim * self.total_num_kv_heads, eps=rms_norm_eps
         )
 
+    def _use_minimax_m2_fused_qkv(self) -> bool:
+        return (
+            minimax_m2_fused_qkv_enabled()
+            and minimax_m2_fused_qkv_available()
+            and isinstance(self.qkv_proj.quant_method, UnquantizedLinearMethod)
+        )
+
+    def _get_qkv_workspace(
+        self, num_tokens: int, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        out_dim = self.q_size + 2 * self.kv_size
+        buf = getattr(self, "_qkv_workspace", None)
+        if (
+            buf is None
+            or buf.size(0) < num_tokens
+            or buf.dtype != dtype
+            or buf.device != device
+        ):
+            self._qkv_workspace = torch.empty(
+                num_tokens, out_dim, dtype=dtype, device=device
+            )
+        return self._qkv_workspace[:num_tokens]
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = MiniMaxText01RMSNormTP.forward_qk(
-            self.q_norm, self.k_norm, q.contiguous(), k.contiguous()
-        )
-        q, k = self.rotary_emb(positions, q, k)
+        if self._use_minimax_m2_fused_qkv():
+            num_tokens = hidden_states.size(0)
+            qkv = self._get_qkv_workspace(
+                num_tokens, hidden_states.dtype, hidden_states.device
+            )
+            qkv_bias = (
+                None
+                if self.qkv_proj.bias is None or self.qkv_proj.skip_bias_add
+                else self.qkv_proj.bias
+            )
+            minimax_m2_fused_qkv_from_hidden(
+                hidden_states=hidden_states,
+                positions=positions,
+                qkv=qkv,
+                qkv_weight=self.qkv_proj.weight,
+                qkv_bias=qkv_bias,
+                q_norm_weight=self.q_norm.weight,
+                k_norm_weight=self.k_norm.weight,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                num_heads_q=self.num_heads,
+                num_heads_k=self.num_kv_heads,
+                num_heads_v=self.num_kv_heads,
+                head_dim=self.head_dim,
+                eps=self.q_norm.variance_epsilon,
+                is_neox=self.rotary_emb.is_neox_style,
+                tp_world=self.q_norm.tp_world,
+            )
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = MiniMaxText01RMSNormTP.forward_qk(
+                self.q_norm, self.k_norm, q.contiguous(), k.contiguous()
+            )
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output

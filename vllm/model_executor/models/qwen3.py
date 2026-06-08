@@ -30,16 +30,23 @@ import torch
 from torch import nn
 from transformers import Qwen3Config
 
+from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.attention.encoder_only_attention import (
     Attention,
     EncoderOnlyAttention,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    QKVParallelLinear,
+    RowParallelLinear,
+    UnquantizedLinearMethod,
+)
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -48,7 +55,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.v1.attention.backend import AttentionType
 
-from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
+from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
 from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
@@ -57,6 +64,8 @@ logger = init_logger(__name__)
 
 
 class Qwen3Attention(nn.Module):
+    _logged_qk_norm_rope_execution: str | None = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -141,22 +150,210 @@ class Qwen3Attention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.use_custom_qkv_proj = self._can_use_custom_qkv_proj(
+            rope_parameters, dual_chunk_attention_config
+        )
+        self.use_fused_kv_cache_write = self.use_custom_qkv_proj
+
+    def _can_use_custom_qkv_proj(
+        self,
+        rope_parameters: dict | None,
+        dual_chunk_attention_config: dict[str, Any] | None,
+    ) -> bool:
+        import vllm._C  # noqa: F401 — register torch.ops._C
+
+        if not current_platform.is_cuda_alike():
+            return False
+        if not hasattr(torch.ops._C, "custom_qkv_proj_rmsnorm_rope"):
+            return False
+        if not hasattr(torch.ops._C, "custom_qkj_proj_rmsnormal_reshap_cache"):
+            return False
+        if not isinstance(self.qkv_proj.quant_method, UnquantizedLinearMethod):
+            return False
+        if dual_chunk_attention_config is not None:
+            return False
+        rope_parameters = rope_parameters or {}
+        if rope_parameters.get("rope_type", "default") != "default":
+            return False
+        if rope_parameters.get("partial_rotary_factor", 1.0) != 1.0:
+            return False
+        if "mrope_section" in rope_parameters:
+            return False
+        if not getattr(self.rotary_emb, "is_neox_style", False):
+            return False
+        return True
+
+    @staticmethod
+    def _split_flash_kv_cache(
+        kv_cache: torch.Tensor, layer_name: str
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Split stacked KV cache into key/value views for Flash NHD layout.
+
+        Per-layer cache is usually [2, num_blocks, block_size, num_kv_heads, H].
+        Cross-layer uniform buffers may be [num_layers, 2, num_blocks, ...].
+        """
+        if kv_cache.numel() == 0 or kv_cache.dim() < 4:
+            return None, None
+        if kv_cache.shape[0] == 2:
+            return kv_cache.unbind(0)
+        if kv_cache.shape[1] == 2:
+            return kv_cache.unbind(1)
+        if kv_cache.dim() >= 5 and kv_cache.shape[1] == 2:
+            layer_idx = extract_layer_index(layer_name)
+            if layer_idx < 0 or layer_idx >= kv_cache.shape[0]:
+                return None, None
+            return kv_cache[layer_idx].unbind(0)
+        return None, None
+
+    def _get_fused_kv_cache_write_tensors(
+        self, num_tokens: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        if not self.use_fused_kv_cache_write:
+            return None, None, None
+        try:
+            _, _, kv_cache, layer_slot_mapping = get_attention_context(
+                self.attn.layer_name
+            )
+        except (AssertionError, AttributeError, KeyError):
+            return None, None, None
+        if layer_slot_mapping is None:
+            return None, None, None
+        if layer_slot_mapping.size(0) < num_tokens:
+            return None, None, None
+        key_cache, value_cache = self._split_flash_kv_cache(
+            kv_cache, self.attn.layer_name
+        )
+        if key_cache is None or value_cache is None:
+            return None, None, None
+        slot_mapping = layer_slot_mapping[:num_tokens]
+        return key_cache, value_cache, slot_mapping
+
+    def _get_qkv_workspace(
+        self, num_tokens: int, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        out_dim = self.q_size + 2 * self.kv_size
+        buf = getattr(self, "_qkv_workspace", None)
+        if (
+            buf is None
+            or buf.size(0) < num_tokens
+            or buf.dtype != dtype
+            or buf.device != device
+        ):
+            self._qkv_workspace = torch.empty(
+                num_tokens, out_dim, dtype=dtype, device=device
+            )
+        return self._qkv_workspace[:num_tokens]
+
+    def _custom_qkv_proj_rmsnorm_rope(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.size(0)
+        qkv = self._get_qkv_workspace(
+            num_tokens, hidden_states.dtype, hidden_states.device
+        )
+        qkv_bias = (
+            None
+            if self.qkv_proj.bias is None or self.qkv_proj.skip_bias_add
+            else self.qkv_proj.bias
+        )
+        key_cache, value_cache, slot_mapping = self._get_fused_kv_cache_write_tensors(
+            num_tokens
+        )
+        fused_cache = key_cache is not None
+        log_tag = (
+            "custom_qkj_proj_rmsnormal_reshap_cache"
+            if fused_cache
+            else "custom_qkv_proj_rmsnorm_rope"
+        )
+        cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(hidden_states)
+        is_neox = self.rotary_emb.is_neox_style
+        if Qwen3Attention._logged_qk_norm_rope_execution != log_tag:
+            logger.info(
+                "Qwen3Attention: executing %s "
+                "(fused_kv_cache_write=%s, num_tokens=%s, hidden=%s, "
+                "num_heads_q=%s, num_heads_k=%s, head_dim=%s, rotary_dim=%s, "
+                "is_neox=%s)",
+                log_tag,
+                fused_cache,
+                num_tokens,
+                hidden_states.size(-1),
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                is_neox,
+            )
+            Qwen3Attention._logged_qk_norm_rope_execution = log_tag
+        if fused_cache:
+            assert key_cache is not None
+            assert value_cache is not None
+            assert slot_mapping is not None
+            ops.custom_qkj_proj_rmsnormal_reshap_cache(
+                qkv,
+                hidden_states,
+                self.qkv_proj.weight,
+                qkv_bias,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                is_neox,
+                positions.view(-1),
+                key_cache,
+                value_cache,
+                slot_mapping,
+            )
+        else:
+            ops.custom_qkv_proj_rmsnorm_rope(
+                qkv,
+                hidden_states,
+                self.qkv_proj.weight,
+                qkv_bias,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                is_neox,
+                positions.view(-1),
+            )
+        q = qkv[:, : self.q_size]
+        if fused_cache:
+            # K/V written in custom op; pass None so Attention skips
+            # unified_kv_cache_update (reshape_and_cache_flash).
+            return q, None, None
+        # Fallback when slot_mapping/kv_cache unavailable (e.g. profiling).
+        k = qkv[:, self.q_size : self.q_size + self.kv_size]
+        v = qkv[:, self.q_size + self.kv_size :]
+        return q, k, v
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
+        if self.use_custom_qkv_proj:
+            q, k, v = self._custom_qkv_proj_rmsnorm_rope(hidden_states, positions)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Add qk-norm
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            q = q_by_head.view(q.shape)
+            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+            k_by_head = self.k_norm(k_by_head)
+            k = k_by_head.view(k.shape)
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -258,7 +455,9 @@ class Qwen3Model(Qwen2Model):
         )
 
 
-class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
+class Qwen3ForCausalLM(
+    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
+):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -283,6 +482,7 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
         self.config = config
 
+        self.vllm_config = vllm_config
         self.quant_config = quant_config
         self.model = Qwen3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
@@ -306,13 +506,6 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-
-    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = layers
-
-    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        num_layers = len(self.model.layers)
-        return (2, num_layers // 2, num_layers - 3)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
